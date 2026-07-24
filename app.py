@@ -8,6 +8,7 @@ import plotly.express as px
 import seaborn as sns
 import streamlit as st
 from matplotlib.colors import LinearSegmentedColormap
+from scipy import stats
 
 # ---------------------------------------------------------------------------
 # Configuración de página y paleta (validada para lectura por color y CVD)
@@ -380,18 +381,43 @@ with tab_story:
             "botella es el manejo agronómico y no el tamaño del predio."
         )
 
-    st.markdown("#### 3. El riego tecnificado sí marca una diferencia productiva")
-    if riego_gap_pct is not None:
+    st.markdown("#### 3. Pregunta de negocio: ¿el riego tecnificado impacta realmente la producción por hectárea?")
+    riego_true_vals = df.loc[df["Sistema_Riego_Tecnificado"], "Rendimiento_Ton_Ha"]
+    riego_false_vals = df.loc[~df["Sistema_Riego_Tecnificado"], "Rendimiento_Ton_Ha"]
+
+    if riego_gap_pct is not None and len(riego_true_vals) > 1 and len(riego_false_vals) > 1:
         direction = "mayor" if riego_gap_pct > 0 else "menor"
+        t_stat, p_value = stats.ttest_ind(riego_true_vals, riego_false_vals, equal_var=False)
+        n1, n2 = len(riego_true_vals), len(riego_false_vals)
+        pooled_std = np.sqrt(
+            ((n1 - 1) * riego_true_vals.std(ddof=1) ** 2 + (n2 - 1) * riego_false_vals.std(ddof=1) ** 2)
+            / (n1 + n2 - 2)
+        )
+        cohend = (riego_true_vals.mean() - riego_false_vals.mean()) / pooled_std if pooled_std else np.nan
+        effect_label = "grande" if abs(cohend) >= 0.8 else "moderado" if abs(cohend) >= 0.5 else "pequeño"
+        is_significant = p_value < 0.05
+        verdict = "Sí" if is_significant else "No de forma concluyente"
+        callout = st.success if is_significant else st.warning
+
+        callout(
+            f"**Respuesta: {verdict}.** Las fincas con riego tecnificado producen en promedio "
+            f"**{riego_true_vals.mean():.2f} ton/ha** frente a **{riego_false_vals.mean():.2f} ton/ha** sin riego "
+            f"(**{abs(riego_gap_pct):.0f}% {direction}**). La diferencia {'sí es' if is_significant else 'no es'} "
+            f"estadísticamente significativa (prueba t de Welch, p = {p_value:.3f}"
+            f"{', < 0.05' if is_significant else ', ≥ 0.05'}), con un tamaño de efecto (d de Cohen) de "
+            f"**{cohend:.2f}** — considerado **{effect_label}**."
+        )
         st.markdown(
-            f"Las fincas con riego tecnificado alcanzan un rendimiento **{abs(riego_gap_pct):.0f}% {direction}** "
-            f"que las que no lo tienen ({yield_by_riego.get(True, float('nan')):.2f} vs. "
-            f"{yield_by_riego.get(False, float('nan')):.2f} ton/ha). Sin embargo, solo el "
-            f"**{riego_adoption:.0f}%** de las fincas filtradas cuentan con este sistema, lo que deja un margen "
-            "claro de mejora vía adopción tecnológica."
+            "El patrón se confirma también en producción total (no solo por hectárea): consulta el boxplot "
+            "*Producción anual: fincas con riego vs. sin riego* en la pestaña 📊 Visualizaciones. Sin embargo, "
+            f"solo el **{riego_adoption:.0f}%** de las fincas filtradas cuentan hoy con riego tecnificado, lo que "
+            "convierte su adopción en una palanca de inversión con impacto medible y todavía poco explotada."
         )
     else:
-        st.markdown("No hay suficientes fincas con y sin riego en la selección actual para comparar.")
+        st.markdown(
+            "No hay suficientes fincas con y sin riego en la selección actual para responder esta pregunta "
+            "con rigor estadístico."
+        )
 
     st.markdown("#### 4. La tecnificación no se traduce automáticamente en mejor precio de venta")
     price_range_pct = (price_by_tech.max() - price_by_tech.min()) / price_by_tech.mean() * 100
