@@ -300,6 +300,16 @@ with tab_viz:
     style_fig(fig, height=400, legend_title_text="")
     st.plotly_chart(fig, width="stretch")
 
+    st.subheader("Producción anual: fincas con riego vs. sin riego")
+    fig = px.box(
+        df, x="Riego", y="Produccion_Anual_Ton", color="Riego",
+        color_discrete_map=RIEGO_COLORS, points="outliers",
+        category_orders={"Riego": ["Con riego tecnificado", "Sin riego tecnificado"]},
+        labels={"Produccion_Anual_Ton": "Producción anual (ton)", "Riego": ""},
+    )
+    style_fig(fig, showlegend=False, height=400)
+    st.plotly_chart(fig, width="stretch")
+
     st.subheader("Concentración de área y eficiencia por departamento y cultivo")
     tree = df.groupby(["Departamento", "Tipo_Cultivo"], as_index=False, observed=True).agg(
         Area_Hectareas=("Area_Hectareas", "sum"),
