@@ -1,4 +1,5 @@
 """Dashboard de análisis agrícola — Agro Colombia."""
+import json
 from pathlib import Path
 
 import numpy as np
@@ -7,8 +8,120 @@ import matplotlib.pyplot as plt
 import plotly.express as px
 import seaborn as sns
 import streamlit as st
+from groq import Groq
 from matplotlib.colors import LinearSegmentedColormap
 from scipy import stats
+
+GROQ_MODEL_ID = "llama-3.3-70b-versatile"
+
+AGG_METRICS = {
+    "Area_Hectareas": "Área (hectáreas)",
+    "Produccion_Anual_Ton": "Producción anual (ton)",
+    "Precio_Venta_Por_Ton_COP": "Precio de venta (COP/ton)",
+    "Rendimiento_Ton_Ha": "Rendimiento (ton/ha)",
+    "Ingreso_Total_COP": "Ingreso total (COP)",
+    "Ingreso_Por_Ha_COP": "Ingreso por hectárea (COP/ha)",
+}
+AGG_FUNCS = ["mean", "sum", "median", "min", "max", "std", "count"]
+AGG_DIMENSIONS = ["Departamento", "Tipo_Cultivo", "Nivel_Tecnificacion", "Tipo_Suelo", "Riego", "ninguna"]
+
+GROQ_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "agregar_datos",
+            "description": (
+                "Calcula una cifra exacta (agregación) sobre las fincas agrícolas actualmente filtradas en el "
+                "dashboard. Úsala SIEMPRE que necesites un número concreto para responder una pregunta de "
+                "negocio — nunca inventes cifras."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "metrica": {
+                        "type": "string",
+                        "enum": list(AGG_METRICS) + ["conteo_fincas"],
+                        "description": "Variable numérica a agregar, o 'conteo_fincas' para contar fincas.",
+                    },
+                    "agregacion": {
+                        "type": "string",
+                        "enum": AGG_FUNCS,
+                        "description": "Función de agregación (se ignora si metrica es 'conteo_fincas').",
+                    },
+                    "dimension": {
+                        "type": "string",
+                        "enum": AGG_DIMENSIONS,
+                        "description": "Dimensión categórica para agrupar el resultado, o 'ninguna' para un total.",
+                    },
+                },
+                "required": ["metrica", "agregacion", "dimension"],
+            },
+        },
+    }
+]
+
+
+def run_aggregate(data: pd.DataFrame, metrica: str, agregacion: str, dimension: str) -> dict:
+    """Ejecuta una agregación segura (whitelist) sobre el dataframe filtrado para el asistente IA."""
+    if dimension != "ninguna" and dimension not in AGG_DIMENSIONS:
+        return {"error": f"dimensión no soportada: {dimension}"}
+
+    if metrica == "conteo_fincas":
+        if dimension == "ninguna":
+            return {"resultado": int(len(data))}
+        counts = data.groupby(dimension, observed=True).size().sort_values(ascending=False)
+        return {"dimension": dimension, "unidad": "fincas", "valores": {str(k): int(v) for k, v in counts.items()}}
+
+    if metrica not in AGG_METRICS or agregacion not in AGG_FUNCS:
+        return {"error": f"métrica o agregación no soportada: {metrica}/{agregacion}"}
+
+    if dimension == "ninguna":
+        valor = getattr(data[metrica], agregacion)()
+        return {"metrica": metrica, "agregacion": agregacion, "resultado": round(float(valor), 2)}
+
+    grouped = getattr(data.groupby(dimension, observed=True)[metrica], agregacion)().sort_values(ascending=False)
+    return {
+        "metrica": metrica,
+        "agregacion": agregacion,
+        "dimension": dimension,
+        "valores": {str(k): round(float(v), 2) for k, v in grouped.items()},
+    }
+
+
+def ask_ia_analyst(client: Groq, system_prompt: str, history: list, data: pd.DataFrame, max_rounds: int = 4) -> str:
+    """Bucle de tool-calling: el modelo pide cifras reales antes de responder (grounding)."""
+    messages = [{"role": "system", "content": system_prompt}] + history
+    for _ in range(max_rounds):
+        response = client.chat.completions.create(
+            model=GROQ_MODEL_ID, messages=messages, tools=GROQ_TOOLS, tool_choice="auto",
+            temperature=0.3, max_tokens=800,
+        )
+        msg = response.choices[0].message
+        if msg.tool_calls:
+            messages.append({
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {"id": tc.id, "type": "function",
+                     "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                    for tc in msg.tool_calls
+                ],
+            })
+            for tc in msg.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments)
+                    result = run_aggregate(data, **args)
+                except Exception as exc:  # noqa: BLE001 — cualquier fallo se reporta al modelo, no se rompe la app
+                    result = {"error": str(exc)}
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "name": tc.function.name,
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+            continue
+        return msg.content or "No obtuve una respuesta del modelo."
+    return "No pude completar el análisis tras varias consultas de datos. Intenta reformular la pregunta."
 
 # ---------------------------------------------------------------------------
 # Configuración de página y paleta (validada para lectura por color y CVD)
@@ -140,8 +253,8 @@ k4.metric("Rendimiento medio (ton/ha)", f"{df['Rendimiento_Ton_Ha'].mean():.2f}"
 k5.metric("Precio medio (COP/ton)", f"${df['Precio_Venta_Por_Ton_COP'].mean():,.0f}")
 k6.metric("Ingreso total estimado", f"${df['Ingreso_Total_COP'].sum() / 1e9:,.1f} mil M COP")
 
-tab_resumen, tab_eda, tab_viz, tab_story = st.tabs(
-    ["🏠 Resumen", "🔍 EDA", "📊 Visualizaciones", "📖 Storytelling"]
+tab_resumen, tab_eda, tab_viz, tab_story, tab_ia = st.tabs(
+    ["🏠 Resumen", "🔍 EDA", "📊 Visualizaciones", "📖 Storytelling", "🤖 Analista IA"]
 )
 
 # ---------------------------------------------------------------------------
@@ -450,3 +563,84 @@ with tab_story:
         "- **Revisar el manejo agronómico en fincas grandes**: la correlación negativa entre área y rendimiento "
         "indica oportunidades de mejora en predios extensos."
     )
+
+# ---------------------------------------------------------------------------
+# TAB: Analista IA (Groq · Llama 3.3 70B)
+# ---------------------------------------------------------------------------
+with tab_ia:
+    st.subheader("🤖 Analista IA — pregunta al dashboard")
+    st.caption(
+        "Haz preguntas de negocio en lenguaje natural. El asistente consulta cifras reales de las "
+        f"**{len(df):,} fincas filtradas** (Llama 3.3 70B vía Groq) antes de responder — no inventa números."
+    )
+
+    groq_key = st.text_input(
+        "GROQ API Key", type="password", key="groq_api_key_dashboard",
+        help="Tu clave solo se usa en esta sesión de navegador, no se almacena en disco.",
+    )
+
+    with st.expander("ℹ️ Qué puede calcular el asistente"):
+        st.markdown(
+            "- **Métricas:** " + ", ".join(AGG_METRICS.values()) + ", conteo de fincas.\n"
+            "- **Agregaciones:** promedio, suma, mediana, mínimo, máximo, desviación estándar, conteo.\n"
+            "- **Dimensiones:** Departamento, Tipo de cultivo, Nivel de tecnificación, Tipo de suelo, "
+            "Riego tecnificado, o total general.\n\n"
+            "Antes de responder, el asistente consulta estas cifras en tiempo real **sobre los datos "
+            "filtrados en la barra lateral**, en lugar de inventar números."
+        )
+
+    if "ia_messages" not in st.session_state:
+        st.session_state.ia_messages = []
+
+    example_questions = [
+        "¿Cuál es el cultivo más rentable por hectárea?",
+        "¿Qué departamento debería priorizar para expandir cultivos?",
+        "¿Vale la pena invertir en riego tecnificado?",
+        "¿Cómo varía el rendimiento entre niveles de tecnificación?",
+    ]
+    st.markdown("**Preguntas sugeridas:**")
+    qcols = st.columns(len(example_questions))
+    clicked_question = None
+    for qcol, question in zip(qcols, example_questions):
+        if qcol.button(question, width="stretch"):
+            clicked_question = question
+
+    if not groq_key:
+        st.info("Ingresa tu GROQ API Key arriba para activar el analista.")
+    else:
+        groq_client = Groq(api_key=groq_key)
+
+        for msg in st.session_state.ia_messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        user_question = st.chat_input("Escribe tu pregunta de negocio sobre los datos filtrados...")
+        if clicked_question and not user_question:
+            user_question = clicked_question
+
+        if user_question:
+            st.session_state.ia_messages.append({"role": "user", "content": user_question})
+            with st.chat_message("user"):
+                st.markdown(user_question)
+
+            with st.chat_message("assistant"):
+                with st.spinner("Consultando cifras y analizando..."):
+                    system_prompt = (
+                        "Eres un analista de datos agrícolas experto que trabaja sobre un dashboard de fincas "
+                        f"colombianas. El usuario tiene actualmente filtradas {len(df):,} de {len(df_raw):,} "
+                        "fincas totales. Cuando necesites una cifra para responder, SIEMPRE usa la herramienta "
+                        "'agregar_datos' para obtenerla del conjunto de datos filtrado — nunca inventes números. "
+                        "Responde en español, de forma clara y orientada a decisiones de negocio: incluye las "
+                        "cifras obtenidas y una breve interpretación. Si una pregunta no se puede resolver con "
+                        "las métricas y dimensiones disponibles, dilo explícitamente en vez de suponer."
+                    )
+                    try:
+                        answer = ask_ia_analyst(groq_client, system_prompt, st.session_state.ia_messages, df)
+                    except Exception as exc:  # noqa: BLE001 — se muestra el error al usuario, no se rompe la app
+                        answer = f"⚠️ Ocurrió un error al consultar la API de Groq: {exc}"
+                st.markdown(answer)
+            st.session_state.ia_messages.append({"role": "assistant", "content": answer})
+
+        if st.session_state.ia_messages and st.button("🗑️ Borrar conversación con el analista"):
+            st.session_state.ia_messages = []
+            st.rerun()
